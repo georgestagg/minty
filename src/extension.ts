@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import OpenAI from 'openai';
+import * as path from 'path';
 
 let diagnosticCollection: vscode.DiagnosticCollection;
 let extensionContext: vscode.ExtensionContext;
@@ -25,6 +26,24 @@ interface MintyDiagnostic extends vscode.Diagnostic {
     }
   };
 }
+
+const readFileTool = {
+  type: "function" as const,
+  function: {
+    name: "read_file",
+    description: "Read the contents of a file relative to the current file",
+    parameters: {
+      type: "object",
+      properties: {
+        filePath: {
+          type: "string",
+          description: "The path of the file to read, relative to the current file"
+        }
+      },
+      required: ["filePath"]
+    }
+  }
+};
 
 export async function activate(context: vscode.ExtensionContext) {
   extensionContext = context;
@@ -127,14 +146,182 @@ function cleanResponse(response: string): string {
   return response.replace(/```json\n?|\n?```/g, '').trim();
 }
 
+async function readFile(filePath: string, currentFilePath: string): Promise<string> {
+  const currentDir = path.dirname(currentFilePath);
+  const fullPath = path.join(currentDir, filePath);
+  const uri = vscode.Uri.file(fullPath);
+
+  try {
+    const content = await vscode.workspace.fs.readFile(uri);
+    return content.toString();
+  } catch (error) {
+    console.error(`Error reading file ${fullPath}:`, error);
+    return `Error: Unable to read file ${filePath}`;
+  }
+}
+
 async function lintDocument(document: vscode.TextDocument) {
-  const text = document.getText();
   const fileName = document.fileName;
+  const lineHints = getLineHints(document);
 
-  const lines = text.split('\n');
-  const lineHints = lines.map((line, i) => `${i}: ${line}`).join('\n');
+  await vscode.window.withProgress({
+    location: vscode.ProgressLocation.Notification,
+    title: "Minty: Linting document...",
+    cancellable: false
+  }, async (progress) => {
+    try {
+      const diagnostics = await getLintingDiagnostics(fileName, lineHints);
+      applyDiagnostics(document, diagnostics);
+    } catch (error) {
+      handleLintingError(error);
+    }
+  });
+}
 
-  const systemPrompt = String.raw`
+function getLineHints(document: vscode.TextDocument): string {
+  const lines = document.getText().split('\n');
+  return lines.map((line, i) => `${i}: ${line}`).join('\n');
+}
+
+async function getLintingDiagnostics(fileName: string, lineHints: string): Promise<LinterDiagnostic[]> {
+  if (!openai) {
+    throw new Error('OpenAI client is not initialized. Please set your API key.');
+  }
+
+  const messages = await conductConversationWithLLM(fileName, lineHints);
+  const finalResponse = extractFinalResponse(messages);
+  return parseLintingResponse(finalResponse);
+}
+
+async function conductConversationWithLLM(fileName: string, lineHints: string): Promise<OpenAI.Chat.ChatCompletionMessageParam[]> {
+  let messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: "system", content: getSystemPrompt() },
+    { role: "user", content: `Filename: ${fileName}\n\nContent:\n${lineHints}` }
+  ];
+
+  let toolCalls: OpenAI.Chat.ChatCompletionMessageToolCall[] | undefined;
+
+  do {
+    const completion = await openai!.chat.completions.create({
+      model: "gpt-4o",
+      messages: messages,
+      tools: [readFileTool],
+      tool_choice: "auto",
+      temperature: 0.1,
+    });
+
+    const lastMessage = completion.choices[0].message;
+    messages.push(lastMessage as OpenAI.Chat.ChatCompletionMessageParam);
+
+    toolCalls = lastMessage.tool_calls;
+
+    if (toolCalls) {
+      const toolResponses = await handleToolCalls(toolCalls, fileName);
+      messages.push(...toolResponses as OpenAI.Chat.ChatCompletionMessageParam[]);
+    }
+  } while (toolCalls && toolCalls.length > 0);
+
+  return messages;
+}
+
+async function handleToolCalls(toolCalls: OpenAI.Chat.ChatCompletionMessageToolCall[], fileName: string): Promise<OpenAI.Chat.ChatCompletionMessageParam[]> {
+  return Promise.all(toolCalls.map(async (toolCall) => {
+    if (toolCall.function.name === "read_file") {
+      return handleReadFileTool(toolCall, fileName);
+    } else {
+      console.log(`Unknown tool call: ${toolCall.function.name}`);
+      return { role: "tool", tool_call_id: toolCall.id, content: `Error: Unknown tool ${toolCall.function.name}` } as const;
+    }
+  }));
+}
+
+async function handleReadFileTool(toolCall: OpenAI.Chat.ChatCompletionMessageToolCall, fileName: string): Promise<OpenAI.Chat.ChatCompletionMessageParam> {
+  const filePath = JSON.parse(toolCall.function.arguments).filePath;
+  console.log(`Tool call: read_file - Requested file: ${filePath}`);
+  const fileContent = await readFile(filePath, fileName);
+
+  if (fileContent !== null) {
+    console.log(`Processed tool call: read_file - File: ${filePath}`);
+    return { role: "tool", tool_call_id: toolCall.id, content: fileContent } as const;
+  } else {
+    console.log(`Failed to process tool call: read_file - File not found or unreadable: ${filePath}`);
+    return { role: "tool", tool_call_id: toolCall.id, content: `Error: Unable to read file ${filePath}` } as const;
+  }
+}
+
+function extractFinalResponse(messages: OpenAI.Chat.ChatCompletionMessageParam[]): string {
+  const finalMessage = messages[messages.length - 1];
+  if (finalMessage.role !== 'assistant') {
+    throw new Error('Unexpected final message from OpenAI API');
+  }
+
+  if (typeof finalMessage.content === 'string') {
+    return finalMessage.content;
+  } else if (Array.isArray(finalMessage.content)) {
+    return finalMessage.content
+      .filter(part => part.type === 'text')
+      .map(part => (part as { text: string }).text)
+      .join('');
+  } else {
+    throw new Error('Unexpected content format in final message');
+  }
+}
+
+function parseLintingResponse(response: string): LinterDiagnostic[] {
+  const cleanedResponse = cleanResponse(response);
+  console.log('Raw response:', cleanedResponse);
+  try {
+    return JSON.parse(cleanedResponse);
+  } catch (parseError) {
+    console.error('Error parsing OpenAI response:', parseError);
+    throw new Error('Failed to parse OpenAI response');
+  }
+}
+
+function applyDiagnostics(document: vscode.TextDocument, diagnosticsData: LinterDiagnostic[]) {
+  const diagnostics: MintyDiagnostic[] = diagnosticsData.map((item: LinterDiagnostic) => {
+    const line = document.lineAt(item.lineNumber);
+    const startIndex = line.text.indexOf(item.problematicText);
+    
+    if (startIndex === -1) {
+      console.warn(`Problematic text "${item.problematicText}" not found on line ${item.lineNumber}`);
+      return null;
+    }
+
+    const endIndex = startIndex + item.problematicText.length;
+    const range = new vscode.Range(
+      new vscode.Position(item.lineNumber, startIndex),
+      new vscode.Position(item.lineNumber, endIndex)
+    );
+
+    const diagnostic: MintyDiagnostic = new vscode.Diagnostic(
+      range,
+      item.message,
+      convertSeverity(item.severity)
+    );
+    
+    if (item.fix) {
+      diagnostic.data = { 
+        fix: {
+          title: item.fix.title,
+          edits: item.fix.replacement
+        }
+      };
+    }
+    
+    return diagnostic;
+  }).filter((diagnostic): diagnostic is MintyDiagnostic => diagnostic !== null);
+
+  diagnosticCollection.set(document.uri, diagnostics);
+}
+
+function handleLintingError(error: unknown) {
+  console.error('Error during linting:', error);
+  vscode.window.showErrorMessage('Error occurred while linting the file.');
+}
+
+function getSystemPrompt(): string {
+  return String.raw`
     You are a code linter. You understand code written in many different programming languages.
 
     IMPORTANT: When reporting diagnostic ranges, use 0-based line positions.
@@ -145,6 +332,8 @@ async function lintDocument(document: vscode.TextDocument) {
     1:   console.log("world")
     2: }
 
+    You can request to read additional files for context using the read_file function.
+
     Analyze the given code and return a JSON array of diagnostics. Each diagnostic should have:
     - lineNumber (0-based line number where the issue occurs)
     - problematicText (the exact substring that is problematic)
@@ -154,98 +343,10 @@ async function lintDocument(document: vscode.TextDocument) {
       - title (short description of the fix)
       - replacement (the text to replace the problematic substring with)
     
-    Example diagnostic with a fix:
-    {
-      "lineNumber": 0,
-      "problematicText": "function hello",
-      "message": "Function name should be in camelCase",
-      "severity": "warning",
-      "fix": {
-        "title": "Convert to camelCase",
-        "replacement": "function sayHello"
-      }
-    }
-    
     If there are no problems in the given code, just return an empty JSON array.
 
     IMPORTANT: Respond ONLY with the JSON array, without any additional text or formatting.
   `;
-
-  await vscode.window.withProgress({
-    location: vscode.ProgressLocation.Notification,
-    title: "Minty: Linting document...",
-    cancellable: false
-  }, async (progress) => {
-    try {
-      if (!openai) {
-        vscode.window.showWarningMessage('OpenAI client is not initialized. Please set your API key.');
-        return;
-      }
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: `Filename: ${fileName}\n\nContent:\n${lineHints}` }
-        ],
-        temperature: 0.1,
-      });
-  
-      const responseContent = completion.choices[0].message.content;
-      if (!responseContent) {
-        throw new Error('Empty response from OpenAI API');
-      }
-  
-      let diagnosticsData: LinterDiagnostic[];
-      const cleanedResponse = cleanResponse(responseContent);
-      console.log('Raw response:', cleanedResponse);
-      try {
-        diagnosticsData = JSON.parse(cleanedResponse);
-      } catch (parseError) {
-        console.error('Error parsing OpenAI response:', parseError);
-        throw new Error('Failed to parse OpenAI response');
-      }
-  
-      const diagnostics: MintyDiagnostic[] = diagnosticsData.map((item: LinterDiagnostic) => {
-        const line = document.lineAt(item.lineNumber);
-        const startIndex = line.text.indexOf(item.problematicText);
-        
-        // Ensure startIndex is non-negative
-        if (startIndex === -1) {
-          console.warn(`Problematic text "${item.problematicText}" not found on line ${item.lineNumber}`);
-          return null;
-        }
-    
-        const endIndex = startIndex + item.problematicText.length;
-    
-        const range = new vscode.Range(
-          new vscode.Position(item.lineNumber, startIndex),
-          new vscode.Position(item.lineNumber, endIndex)
-        );
-    
-        const diagnostic: MintyDiagnostic = new vscode.Diagnostic(
-          range,
-          item.message,
-          convertSeverity(item.severity)
-        );
-        
-        if (item.fix) {
-          diagnostic.data = { 
-            fix: {
-              title: item.fix.title,
-              edits: item.fix.replacement
-            }
-          };
-        }
-        
-        return diagnostic;
-      }).filter((diagnostic): diagnostic is MintyDiagnostic => diagnostic !== null);
-    
-      diagnosticCollection.set(document.uri, diagnostics);
-    } catch (error) {
-      console.error('Error calling OpenAI API:', error);
-      vscode.window.showErrorMessage('Error occurred while linting the file.');
-    }
-  });
 }
 
 function convertSeverity(severity: string): vscode.DiagnosticSeverity {
