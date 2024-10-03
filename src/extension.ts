@@ -146,7 +146,7 @@ function cleanResponse(response: string): string {
   return response.replace(/```json\n?|\n?```/g, '').trim();
 }
 
-async function readFile(filePath: string, currentFilePath: string): Promise<string> {
+async function readFile(filePath: string, currentFilePath: string): Promise<string | null> {
   const currentDir = path.dirname(currentFilePath);
   const fullPath = path.join(currentDir, filePath);
   const uri = vscode.Uri.file(fullPath);
@@ -155,8 +155,8 @@ async function readFile(filePath: string, currentFilePath: string): Promise<stri
     const content = await vscode.workspace.fs.readFile(uri);
     return content.toString();
   } catch (error) {
-    console.error(`Error reading file ${fullPath}:`, error);
-    return `Error: Unable to read file ${filePath}`;
+    // Instead of logging the error, we'll just return null
+    return null;
   }
 }
 
@@ -235,18 +235,40 @@ async function handleToolCalls(toolCalls: OpenAI.Chat.ChatCompletionMessageToolC
   }));
 }
 
-async function handleReadFileTool(toolCall: OpenAI.Chat.ChatCompletionMessageToolCall, fileName: string): Promise<OpenAI.Chat.ChatCompletionMessageParam> {
-  const filePath = JSON.parse(toolCall.function.arguments).filePath;
+async function handleReadFileTool(
+  toolCall: OpenAI.Chat.ChatCompletionMessageToolCall,
+  currentFileName: string
+): Promise<OpenAI.Chat.ChatCompletionMessageParam> {
+  const { filePath } = JSON.parse(toolCall.function.arguments);
   console.log(`Tool call: read_file - Requested file: ${filePath}`);
-  const fileContent = await readFile(filePath, fileName);
+  const fileContent = await readFile(filePath, currentFileName);
+
+  let responseContent: string;
 
   if (fileContent !== null) {
     console.log(`Processed tool call: read_file - File: ${filePath}`);
-    return { role: "tool", tool_call_id: toolCall.id, content: fileContent } as const;
+    responseContent = `
+Current file being linted: ${currentFileName}
+Requested file: ${filePath}
+Content of ${filePath}:
+
+${fileContent}
+`;
   } else {
-    console.log(`Failed to process tool call: read_file - File not found or unreadable: ${filePath}`);
-    return { role: "tool", tool_call_id: toolCall.id, content: `Error: Unable to read file ${filePath}` } as const;
+    console.log(`File not found or unreadable: ${filePath}`);
+    responseContent = `
+Current file being linted: ${currentFileName}
+Requested file: ${filePath}
+
+The file "${filePath}" could not be read. It may not exist or may not be accessible.
+`;
   }
+
+  return {
+    role: "tool",
+    tool_call_id: toolCall.id,
+    content: responseContent.trim()
+  } as const;
 }
 
 function extractFinalResponse(messages: OpenAI.Chat.ChatCompletionMessageParam[]): string {
@@ -282,7 +304,7 @@ function applyDiagnostics(document: vscode.TextDocument, diagnosticsData: Linter
   const diagnostics: MintyDiagnostic[] = diagnosticsData.map((item: LinterDiagnostic) => {
     const line = document.lineAt(item.lineNumber);
     const startIndex = line.text.indexOf(item.problematicText);
-    
+
     if (startIndex === -1) {
       console.warn(`Problematic text "${item.problematicText}" not found on line ${item.lineNumber}`);
       return null;
@@ -299,16 +321,16 @@ function applyDiagnostics(document: vscode.TextDocument, diagnosticsData: Linter
       item.message,
       convertSeverity(item.severity)
     );
-    
+
     if (item.fix) {
-      diagnostic.data = { 
+      diagnostic.data = {
         fix: {
           title: item.fix.title,
           edits: item.fix.replacement
         }
       };
     }
-    
+
     return diagnostic;
   }).filter((diagnostic): diagnostic is MintyDiagnostic => diagnostic !== null);
 
@@ -332,7 +354,10 @@ function getSystemPrompt(): string {
     1:   console.log("world")
     2: }
 
-    You can request to read additional files for context using the read_file function.
+    You can request to read additional files for context using the read_file function. This might
+    be useful for reading additional included or sourced files.
+
+    You may return multiple unrelated linting problems in the same response.
 
     Analyze the given code and return a JSON array of diagnostics. Each diagnostic should have:
     - lineNumber (0-based line number where the issue occurs)
